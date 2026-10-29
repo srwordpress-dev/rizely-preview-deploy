@@ -123,13 +123,13 @@ jobs:
           NEXT_PUBLIC_GTM_ID: ${{ vars.NEXT_PUBLIC_GTM_ID }}
         run: npx -y netlify-cli@17 build --context production
 
-      # 4. The same clean-up done by hand before every preview deploy.
-      - name: Preview clean-up
+      # 4. Drop the prototype pages. No noindex any more: this site becomes
+      #    rizely.net on 29 Oct, and its canonical tags already point there.
+      - name: Clean-up
         if: steps.go.outputs.run == 'true'
         run: |
           set -euo pipefail
           rm -rf out/lab* out/hero-anim*
-          printf '/*\n  X-Robots-Tag: noindex, nofollow\n' > out/_headers
           test -f out/index.html
           test -d .netlify/edge-functions-dist || { echo "::error::Edge function was not bundled"; exit 1; }
 
