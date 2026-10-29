@@ -6,6 +6,10 @@
 #   SOURCE_REPO_TOKEN   classic GitHub token, `repo` scope, that can read agag13/cardping-website
 #   NETLIFY_AUTH_TOKEN  Netlify personal access token
 #   STRAPI_URL          the CMS URL, no trailing slash (https://rizely-cms-v2.onrender.com)
+#
+# Variable (Settings -> Secrets and variables -> Actions -> Variables), optional:
+#   NEXT_PUBLIC_GTM_ID  Google Tag Manager container. Set it to load GTM on the
+#                       preview for testing; delete it to turn tracking off again.
 
 name: Deploy Rizely preview
 
@@ -58,13 +62,15 @@ jobs:
         env:
           SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
           STRAPI_URL: ${{ secrets.STRAPI_URL }}
+          GTM_ID: ${{ vars.NEXT_PUBLIC_GTM_ID }}
         run: |
           set -euo pipefail
           sha=$(git ls-remote "https://x-access-token:${SOURCE_REPO_TOKEN}@github.com/${SOURCE_REPO}.git" "refs/heads/${SOURCE_BRANCH}" | cut -f1)
           test -n "$sha" || { echo "::error::Cannot read ${SOURCE_REPO}@${SOURCE_BRANCH}"; exit 1; }
           posts=$(curl -gfsS "${STRAPI_URL}/api/articles?fields[0]=slug&fields[1]=updatedAt&fields[2]=publishedAt&pagination[pageSize]=100&sort=slug:asc" | sha256sum | cut -c1-16)
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "key=deployed-${sha:0:12}-${posts}" >> "$GITHUB_OUTPUT"
+          # The GTM setting is part of the key, so switching it on or off redeploys.
+          echo "key=deployed-${sha:0:12}-${posts}-gtm${GTM_ID:-off}" >> "$GITHUB_OUTPUT"
           echo "Code ${sha:0:7}, blog fingerprint ${posts}"
 
       # 2. Already deployed exactly this? Then stop here (about 10 seconds).
@@ -114,6 +120,7 @@ jobs:
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           STRAPI_URL: ${{ secrets.STRAPI_URL }}
+          NEXT_PUBLIC_GTM_ID: ${{ vars.NEXT_PUBLIC_GTM_ID }}
         run: npx -y netlify-cli@17 build --context production
 
       # 4. The same clean-up done by hand before every preview deploy.
