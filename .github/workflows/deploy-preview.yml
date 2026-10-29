@@ -1,0 +1,156 @@
+# Builds agag13/cardping-website (dev/homepage) and deploys it to the
+# rizely-homepage-preview Netlify site. Netlify cannot link that repo itself
+# (it lives on someone else's personal GitHub account), so this does the build.
+#
+# Secrets (Settings -> Secrets and variables -> Actions):
+#   SOURCE_REPO_TOKEN   classic GitHub token, `repo` scope, that can read agag13/cardping-website
+#   NETLIFY_AUTH_TOKEN  Netlify personal access token
+#   STRAPI_URL          the CMS URL, no trailing slash (https://rizely-cms-v2.onrender.com)
+
+name: Deploy Rizely preview
+
+on:
+  schedule:
+    - cron: "23 * * * *" # hourly backup; the CMS triggers a run on publish (repository_dispatch)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Deploy even if nothing changed"
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [strapi-publish] # for a Strapi webhook later, if one is ever pointed here
+
+concurrency:
+  group: deploy-preview
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: agag13/cardping-website
+  SOURCE_BRANCH: dev/homepage
+  # Always deploy to this one site. Never run a bare `netlify deploy`.
+  NETLIFY_SITE_ID: b5f2ec03-5815-4792-b33f-99337ac21edf
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # 0. The CMS is on a free host that sleeps when idle. Wake it first, or the
+      #    build reads nothing and ships an empty blog.
+      - name: Wake the CMS
+        env:
+          STRAPI_URL: ${{ secrets.STRAPI_URL }}
+        run: |
+          for i in $(seq 1 18); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "${STRAPI_URL}/_health" || true)
+            if [ "$code" = "204" ] || [ "$code" = "200" ]; then echo "CMS awake"; exit 0; fi
+            echo "CMS not ready yet ($code), waiting"; sleep 10
+          done
+          echo "::error::CMS did not wake up in 3 minutes"; exit 1
+
+      # 1. What would we deploy? The branch's latest commit + the published posts.
+      - name: Fingerprint the code and the blog
+        id: fp
+        env:
+          SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          STRAPI_URL: ${{ secrets.STRAPI_URL }}
+        run: |
+          set -euo pipefail
+          sha=$(git ls-remote "https://x-access-token:${SOURCE_REPO_TOKEN}@github.com/${SOURCE_REPO}.git" "refs/heads/${SOURCE_BRANCH}" | cut -f1)
+          test -n "$sha" || { echo "::error::Cannot read ${SOURCE_REPO}@${SOURCE_BRANCH}"; exit 1; }
+          posts=$(curl -gfsS "${STRAPI_URL}/api/articles?fields[0]=slug&fields[1]=updatedAt&fields[2]=publishedAt&pagination[pageSize]=100&sort=slug:asc" | sha256sum | cut -c1-16)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "key=deployed-${sha:0:12}-${posts}" >> "$GITHUB_OUTPUT"
+          echo "Code ${sha:0:7}, blog fingerprint ${posts}"
+
+      # 2. Already deployed exactly this? Then stop here (about 10 seconds).
+      - name: Check for an earlier deploy of the same thing
+        id: seen
+        uses: actions/cache/restore@v4
+        with:
+          path: .deployed
+          key: ${{ steps.fp.outputs.key }}
+          lookup-only: true
+
+      - name: Decide
+        id: go
+        run: |
+          if [ "${{ steps.seen.outputs.cache-hit }}" = "true" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "Nothing changed since the last deploy, skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 3. Build exactly that commit.
+      - name: Check out the site
+        if: steps.go.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ steps.fp.outputs.sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: Set up Node
+        if: steps.go.outputs.run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        if: steps.go.outputs.run == 'true'
+        run: npm ci
+
+      # `netlify build` (not plain `next build`) so the geo-currency edge
+      # function gets bundled; without it India silently sees USD.
+      - name: Build
+        if: steps.go.outputs.run == 'true'
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          STRAPI_URL: ${{ secrets.STRAPI_URL }}
+        run: npx -y netlify-cli@17 build --context production
+
+      # 4. The same clean-up done by hand before every preview deploy.
+      - name: Preview clean-up
+        if: steps.go.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          rm -rf out/lab* out/hero-anim*
+          printf '/*\n  X-Robots-Tag: noindex, nofollow\n' > out/_headers
+          test -f out/index.html
+          test -d .netlify/edge-functions-dist || { echo "::error::Edge function was not bundled"; exit 1; }
+
+      # 5. Refuse to deploy killed claims or the broken profile link (blog excluded:
+      #    those 3 posts were approved as they are).
+      - name: Content check
+        if: steps.go.outputs.run == 'true'
+        run: |
+          set -uo pipefail
+          hits=$(grep -rlF --exclude-dir=blogs \
+            -e "India's first" -e "99.2%" -e "₹1,499" -e "CamCard" -e "ABBYY" \
+            -e "Microsoft Lens" -e "profile.rizely.net" out || true)
+          if [ -n "$hits" ]; then echo "::error::Banned content in: $hits"; exit 1; fi
+
+      - name: Deploy
+        if: steps.go.outputs.run == 'true'
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+        run: npx -y netlify-cli@17 deploy --prod --site "$NETLIFY_SITE_ID" --dir out --message "dev/homepage ${{ steps.fp.outputs.sha }}"
+
+      # 6. Remember this deploy so the next hourly run can skip.
+      - name: Record the deploy
+        if: steps.go.outputs.run == 'true'
+        run: mkdir -p .deployed && echo "${{ steps.fp.outputs.sha }}" > .deployed/sha
+
+      - name: Save the record
+        if: steps.go.outputs.run == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .deployed
+          key: ${{ steps.fp.outputs.key }}
